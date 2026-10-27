@@ -1,2 +1,8 @@
 gpt2
 review_classifier.pth
+
+.venv/
+.venvfish/
+__pycache__/
+*.py[cod]
+sms_spam_collection.zip

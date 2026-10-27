@@ -5,6 +5,7 @@
 
 
 import os
+import time
 
 import requests
 import json
@@ -39,57 +40,81 @@ def download_and_load_gpt2(model_size, models_dir):
 
     # Load settings and params
     tf_ckpt_path = tf.train.latest_checkpoint(model_dir)
+    if tf_ckpt_path is None:
+        raise RuntimeError(
+            f"No valid TensorFlow checkpoint found in '{model_dir}'. "
+            "The download may be incomplete; delete the directory and try again."
+        )
+
     settings = json.load(open(os.path.join(model_dir, "hparams.json"), "r", encoding="utf-8"))
     params = load_gpt2_params_from_tf_ckpt(tf_ckpt_path, settings)
 
     return settings, params
 
 
-def download_file(url, destination, backup_url=None):
+def download_file(url, destination, backup_url=None, max_retries=3):
     def _attempt_download(download_url):
-        response = requests.get(download_url, stream=True, timeout=60)
+        # Resume a previous partial download when the server supports it
+        existing_size = os.path.getsize(destination) if os.path.exists(destination) else 0
+        headers = {"Range": f"bytes={existing_size}-"} if existing_size else {}
+
+        response = requests.get(download_url, stream=True, timeout=60, headers=headers)
+
+        if existing_size and response.status_code == 416:
+            # Nothing left to fetch: the local file already covers the remote one
+            print(f"File already exists and is up-to-date: {destination}")
+            return
+        if existing_size and response.status_code != 206:
+            # Server ignored the Range header, so start over from scratch
+            existing_size = 0
+
         response.raise_for_status()
 
-        file_size = int(response.headers.get("Content-Length", 0))
+        content_length = int(response.headers.get("Content-Length", 0))
+        file_size = existing_size + content_length if content_length else 0
 
-        # Check if file exists and has same size
-        if os.path.exists(destination):
-            file_size_local = os.path.getsize(destination)
-            if file_size and file_size == file_size_local:
-                print(f"File already exists and is up-to-date: {destination}")
-                return True
-
-        block_size = 1024  # 1 KB
+        block_size = 1024 * 1024  # 1 MB
         desc = os.path.basename(download_url)
-        with tqdm(total=file_size, unit="iB", unit_scale=True, desc=desc) as progress_bar:
-            with open(destination, "wb") as file:
+        mode = "ab" if existing_size else "wb"
+        with tqdm(total=file_size, initial=existing_size, unit="iB", unit_scale=True, desc=desc) as progress_bar:
+            with open(destination, mode) as file:
                 for chunk in response.iter_content(chunk_size=block_size):
                     if chunk:
                         file.write(chunk)
                         progress_bar.update(len(chunk))
-        return True
 
-    try:
-        if _attempt_download(url):
-            return
-    except requests.exceptions.RequestException:
-        if backup_url is not None:
+        if file_size and os.path.getsize(destination) != file_size:
+            raise requests.exceptions.RequestException(
+                f"Incomplete download for {destination}: "
+                f"expected {file_size} bytes, got {os.path.getsize(destination)}"
+            )
+
+    urls = [url] + ([backup_url] if backup_url else [])
+    for index, download_url in enumerate(urls):
+        if index > 0:
             print(f"Primary URL ({url}) failed. Attempting backup URL: {backup_url}")
-            try:
-                if _attempt_download(backup_url):
-                    return
-            except requests.exceptions.RequestException:
-                pass
 
-        error_message = (
-            f"Failed to download from both primary URL ({url})"
-            f"{' and backup URL (' + backup_url + ')' if backup_url else ''}."
-            "\nCheck your internet connection or the file availability.\n"
-            "For help, visit: https://github.com/rasbt/LLMs-from-scratch/discussions/273"
-        )
-        print(error_message)
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        for attempt in range(1, max_retries + 1):
+            try:
+                _attempt_download(download_url)
+                return
+            except requests.exceptions.RequestException as e:
+                print(
+                    f"Download attempt {attempt}/{max_retries} failed for "
+                    f"{download_url}: {e}"
+                )
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+
+    if os.path.exists(destination):
+        os.remove(destination)
+
+    raise RuntimeError(
+        f"Failed to download from both primary URL ({url})"
+        f"{' and backup URL (' + backup_url + ')' if backup_url else ''}."
+        "\nCheck your internet connection or the file availability.\n"
+        "For help, visit: https://github.com/rasbt/LLMs-from-scratch/discussions/273"
+    )
 
 
 # Alternative way using `requests`
